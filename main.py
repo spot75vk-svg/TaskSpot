@@ -12,10 +12,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= КОНФІГУРАЦІЯ =================
 # 1. Вставте ваш токен від BotFather замість тексту у лапках
-BOT_TOKEN = "9036019477:AAGaakCt7DojfxE5ChtjpyDHvIWFI2bQYxQ"
+BOT_TOKEN = "ВАШ_ТОКЕН_ВІД_BOTFATHER"
 
 # 2. Вставте Telegram ID керівників у список (можна додати ще, через кому)
-MANAGERS = [66491739] 
+MANAGERS = [123456789, 987654321] 
 # =================================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -25,6 +25,7 @@ dp = Dispatcher(storage=MemoryStorage())
 def init_db():
     conn = sqlite3.connect("tasks.db")
     cursor = conn.cursor()
+    # Таблиця завдань
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,6 +34,13 @@ def init_db():
             assignee_id INTEGER,
             deadline TEXT,
             status TEXT DEFAULT 'in_progress'
+        )
+    """)
+    # Таблиця працівників
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS employees (
+            telegram_id INTEGER PRIMARY KEY,
+            name TEXT
         )
     """)
     conn.commit()
@@ -89,10 +97,33 @@ def get_stats_summary():
     conn.close()
     return data
 
+def get_employees():
+    conn = sqlite3.connect("tasks.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id, name FROM employees")
+    employees = cursor.fetchall()
+    conn.close()
+    return employees
+
+def add_employee_to_db(telegram_id, name):
+    conn = sqlite3.connect("tasks.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO employees (telegram_id, name) VALUES (?, ?)", (telegram_id, name))
+    conn.commit()
+    conn.close()
+
+def get_employee_name(telegram_id):
+    conn = sqlite3.connect("tasks.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM employees WHERE telegram_id = ?", (telegram_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else f"ID: {telegram_id}"
+
 # --- FSM (СТАНИ ДЛЯ СТВОРЕННЯ ЗАДАЧІ) ---
 class CreateTask(StatesGroup):
     waiting_for_text = State()
-    waiting_for_user_id = State()
+    waiting_for_assignee = State()
     waiting_for_deadline = State()
 
 # --- ХЕНДЛЕРИ ---
@@ -102,16 +133,36 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     text = (
         f"👋 Вітаю! Твій Telegram ID: `{user_id}`\n\n"
-        "Передай цей ID керівнику, щоб він міг ставити тобі задачі.\n"
+        "Передай цей ID керівнику, щоб він міг додати тебе до бази працівників.\n"
     )
     if user_id in MANAGERS:
         text += (
             "\n👑 **Ви визначені як керівник.**\n"
-            "• Створити задачу: /newtask\n"
-            "• Переглянути статистику: /stats"
+            "• Додати працівника: `/addemp ID Ім'я`\n"
+            "• Створити задачу: `/newtask`\n"
+            "• Статистика: `/stats`"
         )
     
     await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("addemp"))
+async def cmd_add_emp(message: types.Message):
+    if message.from_user.id not in MANAGERS:
+        await message.answer("❌ Ця команда доступна тільки керівникам.")
+        return
+    
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer("⚠️ Невірний формат!\nВикористовуйте: `/addemp Telegram_ID Ім'я`\nПриклад: `/addemp 123456789 Іван`", parse_mode="Markdown")
+        return
+    
+    try:
+        emp_id = int(args[1])
+        emp_name = args[2]
+        add_employee_to_db(emp_id, emp_name)
+        await message.answer(f"✅ Працівника **{emp_name}** (`{emp_id}`) успішно додано до бази!", parse_mode="Markdown")
+    except ValueError:
+        await message.answer("⚠️ Telegram ID має складатися лише з цифр.")
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
@@ -126,7 +177,8 @@ async def cmd_stats(message: types.Message):
 
     text = "📊 **Статистика виконання завдань співробітниками:**\n\n"
     for assignee_id, completed, in_progress, overdue in stats_data:
-        text += f"👤 **Працівник ID:** `{assignee_id}`\n"
+        emp_name = get_employee_name(assignee_id)
+        text += f"👤 **Працівник:** {emp_name} (`{assignee_id}`)\n"
         text += f"   • Виконано: ✅ **{completed}**\n"
         text += f"   • В роботі: ⏳ **{in_progress}**\n"
         text += f"   • Протерміновано: ⏰ **{overdue}**\n\n"
@@ -145,20 +197,29 @@ async def cmd_newtask(message: types.Message, state: FSMContext):
 @dp.message(CreateTask.waiting_for_text)
 async def process_task_text(message: types.Message, state: FSMContext):
     await state.update_data(task_text=message.text)
-    await message.answer("Введіть Telegram ID працівника, якому призначається задача:")
-    await state.set_state(CreateTask.waiting_for_user_id)
-
-@dp.message(CreateTask.waiting_for_user_id)
-async def process_user_id(message: types.Message, state: FSMContext):
-    try:
-        assignee_id = int(message.text)
-    except ValueError:
-        await message.answer("⚠️ ID має складатися лише з цифр. Спробуйте ще раз:")
+    
+    employees = get_employees()
+    if not employees:
+        await message.answer("⚠️ База працівників порожня! Спочатку додайте працівника командою `/addemp ID Ім'я`.", parse_mode="Markdown")
+        await state.clear()
         return
 
+    kb = InlineKeyboardBuilder()
+    for emp_id, emp_name in employees:
+        kb.button(text=f"👤 {emp_name}", callback_data=f"select_emp_{emp_id}")
+    kb.adjust(1)
+
+    await message.answer("Виберіть працівника, якому призначається завдання:", reply_markup=kb.as_markup())
+    await state.set_state(CreateTask.waiting_for_assignee)
+
+@dp.callback_query(F.data.startswith("select_emp_"), CreateTask.waiting_for_assignee)
+async def process_employee_selection(callback: types.CallbackQuery, state: FSMContext):
+    assignee_id = int(callback.data.split("_")[2])
     await state.update_data(assignee_id=assignee_id)
-    await message.answer("Введіть дедлайн виконання у форматі `ДД.ММ.РРРР ГГ:ХХ`\n(Наприклад: `15.11.2026 18:00`):", parse_mode="Markdown")
+
+    await callback.message.edit_text("Введіть дедлайн виконання у форматі `ДД.ММ.РРРР ГГ:ХХ`\n(Наприклад: `15.11.2026 18:00`):", parse_mode="Markdown")
     await state.set_state(CreateTask.waiting_for_deadline)
+    await callback.answer()
 
 @dp.message(CreateTask.waiting_for_deadline)
 async def process_deadline(message: types.Message, state: FSMContext):
@@ -178,7 +239,8 @@ async def process_deadline(message: types.Message, state: FSMContext):
     task_id = add_task(task_text, manager_id, assignee_id, deadline_str)
     await state.clear()
 
-    await message.answer(f"✅ Задачу #{task_id} успішно створено та відправлено працівнику!")
+    emp_name = get_employee_name(assignee_id)
+    await message.answer(f"✅ Задачу #{task_id} успішно створено та відправлено працівнику **{emp_name}**!", parse_mode="Markdown")
 
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Відмітити як виконану", callback_data=f"done_{task_id}")
@@ -304,12 +366,10 @@ async def start_web_server():
 
 async def main():
     init_db()
-    # Скидаємо старий вебхук перед запуском polling
     await bot.delete_webhook(drop_pending_updates=True)
     
     print("Бот запущений і готовий до роботи...")
     
-    # Запускаємо вебсервер, перевірку дедлайнів та бота одночасно
     await asyncio.gather(
         start_web_server(),
         check_deadlines(),
