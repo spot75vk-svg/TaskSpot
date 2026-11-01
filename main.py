@@ -1,6 +1,8 @@
 import asyncio
+import os
 import sqlite3
 from datetime import datetime
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -10,10 +12,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= КОНФІГУРАЦІЯ =================
 # 1. Вставте ваш токен від BotFather замість тексту у лапках
-BOT_TOKEN = "9254514640:AAFEVBuwpVsetoJ98iA_8aBfsmGzhuxWbWw"
+BOT_TOKEN = "ВАШ_ТОКЕН_ВІД_BOTFATHER"
 
 # 2. Вставте Telegram ID керівників у список (можна додати ще, через кому)
-MANAGERS = [66491739] 
+MANAGERS = [123456789, 987654321] 
 # =================================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -287,11 +289,32 @@ async def check_deadlines():
         except Exception as e:
             print(f"Помилка у фоновій перевірці дедлайнів: {e}")
 
+# --- ВЕБСЕРВЕР ДЛЯ RENDER ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 async def main():
     init_db()
-    asyncio.create_task(check_deadlines())
+    # Скидаємо старий вебхук перед запуском polling
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     print("Бот запущений і готовий до роботи...")
-    await dp.start_polling(bot)
+    
+    # Запускаємо вебсервер, перевірку дедлайнів та бота одночасно
+    await asyncio.gather(
+        start_web_server(),
+        check_deadlines(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
