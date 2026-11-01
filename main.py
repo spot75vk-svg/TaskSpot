@@ -12,10 +12,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= КОНФІГУРАЦІЯ =================
 # 1. Вставте ваш токен від BotFather замість тексту у лапках
-BOT_TOKEN = "ВАШ_ТОКЕН_ВІД_BOTFATHER"
+BOT_TOKEN = "9254514640:AAFEVBuwpVsetoJ98iA_8aBfsmGzhuxWbWw"
 
 # 2. Вставте Telegram ID керівників у список (можна додати ще, через кому)
-MANAGERS = [123456789, 987654321] 
+MANAGERS = [66491739] 
 # =================================================
 
 bot = Bot(token=BOT_TOKEN)
