@@ -351,18 +351,9 @@ async def check_deadlines():
         except Exception as e:
             print(f"Помилка у фоновій перевірці дедлайнів: {e}")
 
-# --- ВЕБСЕРВЕР ДЛЯ RENDER ---
+# --- ВЕБСЕРВЕР ТА ГОЛОВНИЙ ЗАПУСК ДЛЯ RENDER ---
 async def handle(request):
     return web.Response(text="Bot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
 
 async def main():
     init_db()
@@ -370,11 +361,23 @@ async def main():
     
     print("Бот запущений і готовий до роботи...")
     
-    await asyncio.gather(
-        start_web_server(),
-        check_deadlines(),
-        dp.start_polling(bot)
-    )
+    # Запускаємо фонову перевірку дедлайнів та polling бота
+    asyncio.create_task(check_deadlines())
+    
+    # Створюємо додаток aiohttp для вебсерверу Render
+    app = web.Application()
+    app.router.add_get("/", handle)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render передає порт через змінну середовища PORT
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    # Запускаємо безперервний поллінг бота в основному потоці
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
