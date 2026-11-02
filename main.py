@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import sqlite3
 from datetime import datetime
@@ -7,13 +8,12 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
 
 # ================= КОНФІГУРАЦІЯ =================
-# Вставте ваш токен від BotFather у лапки нижче:
 BOT_TOKEN = "9071631760:AAFFOcT4-jgBe4PSqQ3VYwveIpGmjZZXck0"
-
-# Перелік Telegram ID керівників (через кому):
 MANAGERS = [66491739]
 # =================================================
 
@@ -78,6 +78,19 @@ def get_active_tasks():
     conn.close()
     return tasks
 
+def get_all_tasks_for_export():
+    conn = sqlite3.connect("tasks.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT t.id, t.text, e.name, t.assignee_id, t.deadline, t.status 
+        FROM tasks t
+        LEFT JOIN employees e ON t.assignee_id = e.telegram_id
+        ORDER BY t.id DESC
+    """)
+    tasks = cursor.fetchall()
+    conn.close()
+    return tasks
+
 def get_stats_summary():
     conn = sqlite3.connect("tasks.db")
     cursor = conn.cursor()
@@ -117,21 +130,80 @@ def get_employee_name(telegram_id):
     conn.close()
     return row[0] if row else f"ID: {telegram_id}"
 
-# --- FSM (СТАНИ) ---
+# --- КЛАВІАТУРИ (МЕНЮ) ---
+def get_manager_keyboard():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="➕ Створити задачу")
+    kb.button(text="📊 Експорт в Excel")
+    kb.button(text="📈 Статистика")
+    kb.adjust(2, 1)
+    return kb.as_markup(resize_keyboard=True)
+
+def get_employee_keyboard():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="📋 Мої активні задачі")
+    kb.adjust(1)
+    return kb.as_markup(resize_keyboard=True)
+
+# --- ГЕНЕРАЦІЯ EXCEL-ЗВІТУ ---
+def generate_excel_report():
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Завдання"
+
+    headers = ["ID Задачі", "Текст завдання", "Виконавець", "ID Виконавця", "Дедлайн", "Статус"]
+    ws.append(headers)
+
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    status_map = {
+        "in_progress": "⏳ В роботі",
+        "completed": "✅ Виконано",
+        "overdue": "⏰ Протерміновано"
+    }
+
+    tasks = get_all_tasks_for_export()
+    for t in tasks:
+        task_id, text, emp_name, assignee_id, deadline, status = t
+        emp_display = emp_name if emp_name else f"ID: {assignee_id}"
+        status_display = status_map.get(status, status)
+        ws.append([task_id, text, emp_display, assignee_id, deadline, status_display])
+
+    for col in ws.columns:
+        max_len = max(len(str(cell.value or '')) for cell in col)
+        col_letter = openpyxl.utils.get_column_letter(col[0].column)
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    file_stream = io.BytesIO()
+    wb.save(file_stream)
+    file_stream.seek(0)
+    return file_stream
+
+# --- FSM СТАНИ ---
 class CreateTask(StatesGroup):
     waiting_for_text = State()
     waiting_for_assignee = State()
     waiting_for_deadline = State()
 
-# --- ХЕНДЛЕРИ ---
+# --- ХЕНДЛЕРИ КОМАНД ТА КНОПОК ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    text = f"👋 Вітаю! Твій Telegram ID: `{user_id}`\n\nПередай цей ID керівнику для додавання до бази."
     if user_id in MANAGERS:
-        text += "\n\n👑 **Ви керівник:**\n• `/addemp ID Ім'я` — додати працівника\n• `/newtask` — створити завдання\n• `/stats` — переглянути статистику"
-    await message.answer(text, parse_mode="Markdown")
+        text = "👑 **Вітаю, пане керівник!**\nВикористовуйте кнопки знизу для керування завданнями:"
+        await message.answer(text, reply_markup=get_manager_keyboard(), parse_mode="Markdown")
+    else:
+        text = (
+            f"👋 Вітаю! Твій Telegram ID: `{user_id}`\n\n"
+            "Передай цей ID своєму керівнику, щоб він додав тебе до бази працівників."
+        )
+        await message.answer(text, reply_markup=get_employee_keyboard(), parse_mode="Markdown")
 
 @dp.message(Command("addemp"))
 async def cmd_add_emp(message: types.Message):
@@ -148,10 +220,22 @@ async def cmd_add_emp(message: types.Message):
     except ValueError:
         await message.answer("⚠️ Telegram ID має складатися лише з цифр.")
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
+@dp.message(F.text == "📊 Експорт в Excel")
+@dp.message(Command("export"))
+async def btn_export(message: types.Message):
     if message.from_user.id not in MANAGERS:
-        await message.answer("❌ Ця команда доступна тільки керівникам.")
+        await message.answer("❌ Ця функція доступна тільки керівникам.")
+        return
+    
+    excel_file = generate_excel_report()
+    doc_file = types.BufferedInputFile(excel_file.read(), filename="tasks_report.xlsx")
+    await message.answer_document(doc_file, caption="📊 **Актуальний звіт із завданнями в Excel**", parse_mode="Markdown")
+
+@dp.message(F.text == "📈 Статистика")
+@dp.message(Command("stats"))
+async def btn_stats(message: types.Message):
+    if message.from_user.id not in MANAGERS:
+        await message.answer("❌ Ця функція доступна тільки керівникам.")
         return
     stats_data = get_stats_summary()
     if not stats_data:
@@ -163,10 +247,11 @@ async def cmd_stats(message: types.Message):
         text += f"👤 **{name}** (`{assignee_id}`):\n   • Виконано: ✅ {completed}\n   • В роботі: ⏳ {in_progress}\n   • Протерміновано: ⏰ {overdue}\n\n"
     await message.answer(text, parse_mode="Markdown")
 
+@dp.message(F.text == "➕ Створити задачу")
 @dp.message(Command("newtask"))
-async def cmd_newtask(message: types.Message, state: FSMContext):
+async def btn_new_task(message: types.Message, state: FSMContext):
     if message.from_user.id not in MANAGERS:
-        await message.answer("❌ Ця команда доступна тільки керівникам.")
+        await message.answer("❌ Ця функція доступна тільки керівникам.")
         return
     await message.answer("Введіть текст завдання:")
     await state.set_state(CreateTask.waiting_for_text)
@@ -179,17 +264,22 @@ async def process_task_text(message: types.Message, state: FSMContext):
         await message.answer("⚠️ База працівників порожня! Додайте співробітника командою `/addemp ID Ім'я`.", parse_mode="Markdown")
         await state.clear()
         return
+
     kb = InlineKeyboardBuilder()
     for emp_id, emp_name in employees:
         kb.button(text=f"👤 {emp_name}", callback_data=f"select_emp_{emp_id}")
     kb.adjust(1)
-    await message.answer("Виберіть працівника:", reply_markup=kb.as_markup())
+
+    await message.answer("Оберіть працівника, якому призначається задача:", reply_markup=kb.as_markup())
     await state.set_state(CreateTask.waiting_for_assignee)
 
 @dp.callback_query(F.data.startswith("select_emp_"), CreateTask.waiting_for_assignee)
 async def process_employee_selection(callback: types.CallbackQuery, state: FSMContext):
-    await state.update_data(assignee_id=int(callback.data.split("_")[2]))
-    await callback.message.edit_text("Введіть дедлайн у форматі `ДД.ММ.РРРР ГГ:ХХ` (наприклад: `15.11.2026 18:00`):", parse_mode="Markdown")
+    assignee_id = int(callback.data.split("_")[2])
+    await state.update_data(assignee_id=assignee_id)
+    emp_name = get_employee_name(assignee_id)
+
+    await callback.message.edit_text(f"Обрано виконавця: **{emp_name}**\n\nТепер введіть дедлайн у форматі `ДД.ММ.РРРР ГГ:ХХ` (наприклад: `15.11.2026 18:00`):", parse_mode="Markdown")
     await state.set_state(CreateTask.waiting_for_deadline)
     await callback.answer()
 
@@ -218,7 +308,7 @@ async def process_deadline(message: types.Message, state: FSMContext):
             parse_mode="Markdown"
         )
     except Exception as e:
-        await message.answer(f"⚠️ Не вдалося надіслати сповіщення у приватні повідомлення: {e}")
+        await message.answer(f"⚠️ Помилка надсилання сповіщення працівнику: {e}")
 
 @dp.callback_query(F.data.startswith("done_"))
 async def process_task_done(callback: types.CallbackQuery):
@@ -268,17 +358,39 @@ async def reject_task(callback: types.CallbackQuery):
     await bot.send_message(task[3], f"⚠️ **Завдання #{task_id} повернуто на доопрацювання!**", reply_markup=kb.as_markup(), parse_mode="Markdown")
     await callback.answer()
 
+# --- ФОНОВИЙ ПЕРЕВІРНИК ДЕДЛАЙНІВ ---
 async def check_deadlines():
     while True:
         await asyncio.sleep(600)
         try:
             for task in get_active_tasks():
-                if datetime.now() > datetime.strptime(task[4], "%d.%m.%Y %H:%M"):
-                    update_task_status(task[0], "overdue")
-                    await bot.send_message(task[3], f"⏰ **УВАГА! Дедлайн завдання #{task[0]} вичерпано!**", parse_mode="Markdown")
-                    await bot.send_message(task[2], f"⚠️ **Дедлайн завдання #{task[0]} протерміновано!**", parse_mode="Markdown")
+                task_id, text, manager_id, assignee_id, deadline_str = task
+                deadline_dt = datetime.strptime(deadline_str, "%d.%m.%Y %H:%M")
+                
+                if datetime.now() > deadline_dt:
+                    update_task_status(task_id, "overdue")
+                    emp_name = get_employee_name(assignee_id)
+
+                    try:
+                        await bot.send_message(
+                            chat_id=assignee_id,
+                            text=f"⏰ **УВАГА! Протерміновано дедлайн за завданням #{task_id}!**\n\n{text}\n\n⏳ **Дедлайн був:** {deadline_str}",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        print(f"Помилка сповіщення працівника: {e}")
+
+                    try:
+                        await bot.send_message(
+                            chat_id=manager_id,
+                            text=f"⚠️ **УВАГА! Недотримано дедлайн!**\n\n👤 **Виконавець:** {emp_name}\n📋 **Завдання #{task_id}:** {text}\n⏳ **Дедлайн був:** {deadline_str}",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        print(f"Помилка сповіщення керівника: {e}")
+
         except Exception as e:
-            print(f"Помилка перевірки дедлайнів: {e}")
+            print(f"Помилка фонової перевірки дедлайнів: {e}")
 
 async def main():
     init_db()
