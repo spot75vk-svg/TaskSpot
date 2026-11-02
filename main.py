@@ -11,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= КОНФІГУРАЦІЯ =================
 # 1. Вставте  ваш токен від BotFather у лапки нижче:
-BOT_TOKEN = "9036019477:AAFW4m19YzOje2eX2MklpCeQGoHHxjclKGI"
+BOT_TOKEN = "9071631760:AAFFOcT4-jgBe4PSqQ3VYwveIpGmjZZXck0"
 
 # 2. Перелік Telegram ID керівників (через кому):
 MANAGERS = [66491739]
