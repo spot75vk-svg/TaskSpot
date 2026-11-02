@@ -31,7 +31,9 @@ def init_db():
             manager_id INTEGER,
             assignee_id INTEGER,
             deadline TEXT,
-            status TEXT DEFAULT 'in_progress'
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
+            alerted_30min INTEGER DEFAULT 0
         )
     """)
     cursor.execute("""
@@ -40,15 +42,29 @@ def init_db():
             name TEXT
         )
     """)
+    # Безпечне додавання нових колонок для існуючих баз даних
+    try:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN status TEXT DEFAULT 'pending'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN created_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN alerted_30min INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
 def add_task(text, manager_id, assignee_id, deadline):
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
     conn = sqlite3.connect("tasks.db")
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO tasks (text, manager_id, assignee_id, deadline, status) VALUES (?, ?, ?, ?, 'in_progress')",
-        (text, manager_id, assignee_id, deadline)
+        "INSERT INTO tasks (text, manager_id, assignee_id, deadline, status, created_at, alerted_30min) VALUES (?, ?, ?, ?, 'pending', ?, 0)",
+        (text, manager_id, assignee_id, deadline, now_str)
     )
     task_id = cursor.lastrowid
     conn.commit()
@@ -65,15 +81,30 @@ def update_task_status(task_id, status):
 def get_task(task_id):
     conn = sqlite3.connect("tasks.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, text, manager_id, assignee_id, deadline, status FROM tasks WHERE id = ?", (task_id,))
+    cursor.execute("SELECT id, text, manager_id, assignee_id, deadline, status, created_at, alerted_30min FROM tasks WHERE id = ?", (task_id,))
     task = cursor.fetchone()
     conn.close()
     return task
 
+def get_pending_unaccepted_tasks():
+    conn = sqlite3.connect("tasks.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, text, manager_id, assignee_id, created_at FROM tasks WHERE status = 'pending' AND alerted_30min = 0")
+    tasks = cursor.fetchall()
+    conn.close()
+    return tasks
+
+def mark_task_alerted(task_id):
+    conn = sqlite3.connect("tasks.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tasks SET alerted_30min = 1 WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+
 def get_active_tasks():
     conn = sqlite3.connect("tasks.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, text, manager_id, assignee_id, deadline FROM tasks WHERE status = 'in_progress'")
+    cursor.execute("SELECT id, text, manager_id, assignee_id, deadline FROM tasks WHERE status IN ('pending', 'in_progress')")
     tasks = cursor.fetchall()
     conn.close()
     return tasks
@@ -81,7 +112,7 @@ def get_active_tasks():
 def get_employee_active_tasks(assignee_id):
     conn = sqlite3.connect("tasks.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, text, deadline FROM tasks WHERE assignee_id = ? AND status = 'in_progress'", (assignee_id,))
+    cursor.execute("SELECT id, text, deadline FROM tasks WHERE assignee_id = ? AND status IN ('pending', 'in_progress')", (assignee_id,))
     tasks = cursor.fetchall()
     conn.close()
     return tasks
@@ -106,7 +137,7 @@ def get_stats_summary():
         SELECT 
             assignee_id,
             SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-            SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
+            SUM(CASE WHEN status IN ('pending', 'in_progress') THEN 1 ELSE 0 END) as in_progress,
             SUM(CASE WHEN status = 'overdue' THEN 1 ELSE 0 END) as overdue
         FROM tasks
         GROUP BY assignee_id
@@ -171,7 +202,8 @@ def generate_excel_report():
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     status_map = {
-        "in_progress": "⏳ В роботі",
+        "pending": "⏳ Очікує прийняття",
+        "in_progress": "🛠 В роботі",
         "completed": "✅ Виконано",
         "overdue": "⏰ Протерміновано"
     }
@@ -274,7 +306,7 @@ async def btn_stats(message: types.Message):
     text = "📊 **Статистика виконання:**\n\n"
     for assignee_id, completed, in_progress, overdue in stats_data:
         name = get_employee_name(assignee_id)
-        text += f"👤 **{name}** (`{assignee_id}`):\n   • Виконано: ✅ {completed}\n   • В роботі: ⏳ {in_progress}\n   • Протерміновано: ⏰ {overdue}\n\n"
+        text += f"👤 **{name}** (`{assignee_id}`):\n   • Виконано: ✅ {completed}\n   • В роботі: 🛠 {in_progress}\n   • Протерміновано: ⏰ {overdue}\n\n"
     await message.answer(text, parse_mode="Markdown")
 
 # --- ЛОГІКА УТОЧНЕНЬ ВІД ПРАЦІВНИКА ---
@@ -415,8 +447,9 @@ async def process_deadline(message: types.Message, state: FSMContext):
     emp_name = get_employee_name(data['assignee_id'])
     await message.answer(f"✅ Задачу #{task_id} відправлено працівнику **{emp_name}**!", parse_mode="Markdown", reply_markup=get_manager_keyboard())
 
+    # Кнопка прийняття в роботу для працівника
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Відмітити як виконану", callback_data=f"done_{task_id}")
+    kb.button(text="✅ Прийняти в роботу", callback_data=f"accept_{task_id}")
     try:
         await bot.send_message(
             chat_id=data['assignee_id'],
@@ -427,6 +460,45 @@ async def process_deadline(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ Помилка надсилання сповіщення працівнику: {e}")
 
+# --- ПРИЙНЯТТЯ ЗАДАЧІ В РОБОТУ ---
+@dp.callback_query(F.data.startswith("accept_"))
+async def process_task_accept(callback: types.CallbackQuery):
+    task_id = int(callback.data.split("_")[1])
+    task = get_task(task_id)
+    if not task:
+        await callback.answer("Завдання не знайдено.")
+        return
+    
+    if task[5] != 'pending':
+        await callback.answer("Завдання вже прийняте або закрите.")
+        return
+
+    update_task_status(task_id, 'in_progress')
+    emp_name = get_employee_name(callback.from_user.id)
+
+    # Заміна кнопки на виконання
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Відмітити як виконану", callback_data=f"done_{task_id}")
+
+    await callback.message.edit_text(
+        f"📋 **Завдання #{task_id} (В роботі):**\n\n{task[1]}\n\n⏳ **Дедлайн:** {task[4]}",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+    # Сповіщення керівнику про прийняття
+    try:
+        await bot.send_message(
+            chat_id=task[2],
+            text=f"👤 **Працівник {emp_name} прийняв в роботу завдання #{task_id}!**",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Помилка сповіщення керівника: {e}")
+
+    await callback.answer("Завдання прийнято в роботу!")
+
+# --- ВИКОНАННЯ ТА ЗАКРИТТЯ ЗАДАЧІ ---
 @dp.callback_query(F.data.startswith("done_"))
 async def process_task_done(callback: types.CallbackQuery):
     task_id = int(callback.data.split("_")[1])
@@ -475,39 +547,62 @@ async def reject_task(callback: types.CallbackQuery):
     await bot.send_message(task[3], f"⚠️ **Завдання #{task_id} повернуто на доопрацювання!**", reply_markup=kb.as_markup(), parse_mode="Markdown")
     await callback.answer()
 
-# --- ФОНОВИЙ ПЕРЕВІРНИК ДЕДЛАЙНІВ ---
+# --- ФОНОВИЙ ПЕРЕВІРНИК (ДЕЛАЙНИ ТА 30 ХВИЛИН НА ПРИЙНЯТТЯ) ---
 async def check_deadlines():
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(300) # Перевірка кожні 5 хвилин
         try:
+            now = datetime.now()
+
+            # 1. Перевірка 30 хвилин на прийняття задачі
+            pending_tasks = get_pending_unaccepted_tasks()
+            for task in pending_tasks:
+                task_id, text, manager_id, assignee_id, created_str = task
+                if created_str:
+                    try:
+                        created_dt = datetime.strptime(created_str, "%d.%m.%Y %H:%M")
+                        if (now - created_dt).total_seconds() > 1800: # 1800 секунд = 30 хвилин
+                            mark_task_alerted(task_id)
+                            emp_name = get_employee_name(assignee_id)
+                            await bot.send_message(
+                                chat_id=manager_id,
+                                text=f"⏰ **УВАГА! Працівник {emp_name} не прийняв в роботу завдання #{task_id} протягом 30 хвилин!**\n\n{text}",
+                                parse_mode="Markdown"
+                            )
+                    except Exception as e:
+                        print(f"Помилка обробки часу створення задачі #{task_id}: {e}")
+
+            # 2. Перевірка протермінованих дедлайнів
             for task in get_active_tasks():
                 task_id, text, manager_id, assignee_id, deadline_str = task
-                deadline_dt = datetime.strptime(deadline_str, "%d.%m.%Y %H:%M")
-                
-                if datetime.now() > deadline_dt:
-                    update_task_status(task_id, "overdue")
-                    emp_name = get_employee_name(assignee_id)
+                try:
+                    deadline_dt = datetime.strptime(deadline_str, "%d.%m.%Y %H:%M")
+                    if now > deadline_dt:
+                        update_task_status(task_id, "overdue")
+                        emp_name = get_employee_name(assignee_id)
 
-                    try:
-                        await bot.send_message(
-                            chat_id=assignee_id,
-                            text=f"⏰ **УВАГА! Протерміновано дедлайн за завданням #{task_id}!**\n\n{text}\n\n⏳ **Дедлайн був:** {deadline_str}",
-                            parse_mode="Markdown"
-                        )
-                    except Exception as e:
-                        print(f"Помилка сповіщення працівника: {e}")
+                        try:
+                            await bot.send_message(
+                                chat_id=assignee_id,
+                                text=f"⏰ **УВАГА! Протерміновано дедлайн за завданням #{task_id}!**\n\n{text}\n\n⏳ **Дедлайн був:** {deadline_str}",
+                                parse_mode="Markdown"
+                            )
+                        except Exception as e:
+                            print(f"Помилка сповіщення працівника: {e}")
 
-                    try:
-                        await bot.send_message(
-                            chat_id=manager_id,
-                            text=f"⚠️ **УВАГА! Недотримано дедлайн!**\n\n👤 **Виконавець:** {emp_name}\n📋 **Завдання #{task_id}:** {text}\n⏳ **Дедлайн був:** {deadline_str}",
-                            parse_mode="Markdown"
-                        )
-                    except Exception as e:
-                        print(f"Помилка сповіщення керівника: {e}")
+                        try:
+                            await bot.send_message(
+                                chat_id=manager_id,
+                                text=f"⚠️ **УВАГА! Недотримано дедлайн!**\n\n👤 **Виконавець:** {emp_name}\n📋 **Завдання #{task_id}:** {text}\n⏳ **Дедлайн був:** {deadline_str}",
+                                parse_mode="Markdown"
+                            )
+                        except Exception as e:
+                            print(f"Помилка сповіщення керівника: {e}")
+                except Exception as e:
+                    print(f"Помилка перевірки дедлайну задачі #{task_id}: {e}")
 
         except Exception as e:
-            print(f"Помилка фонової перевірки дедлайнів: {e}")
+            print(f"Помилка фонового процесу: {e}")
 
 async def main():
     init_db()
