@@ -78,6 +78,14 @@ def get_active_tasks():
     conn.close()
     return tasks
 
+def get_employee_active_tasks(assignee_id):
+    conn = sqlite3.connect("tasks.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, text, deadline FROM tasks WHERE assignee_id = ? AND status = 'in_progress'", (assignee_id,))
+    tasks = cursor.fetchall()
+    conn.close()
+    return tasks
+
 def get_all_tasks_for_export():
     conn = sqlite3.connect("tasks.db")
     cursor = conn.cursor()
@@ -142,7 +150,7 @@ def get_manager_keyboard():
 
 def get_employee_keyboard():
     kb = ReplyKeyboardBuilder()
-    kb.button(text="📋 Мої активні задачі")
+    kb.button(text="❓ Уточнення по задачі")
     kb.adjust(1)
     return kb.as_markup(resize_keyboard=True)
 
@@ -194,6 +202,12 @@ class CreateTask(StatesGroup):
 class AddEmployee(StatesGroup):
     waiting_for_data = State()
 
+class TaskClarification(StatesGroup):
+    waiting_for_question = State()
+
+class ManagerReply(StatesGroup):
+    waiting_for_answer = State()
+
 # --- ХЕНДЛЕРИ КОМАНД ТА КНОПОК ---
 
 @dp.message(Command("start"))
@@ -209,25 +223,13 @@ async def cmd_start(message: types.Message):
         )
         await message.answer(text, reply_markup=get_employee_keyboard(), parse_mode="Markdown")
 
-# Додавання працівника через кнопку або команду
+# Додавання працівника
 @dp.message(F.text == "👤 Додати працівника")
 @dp.message(Command("addemp"))
 async def cmd_add_emp(message: types.Message, state: FSMContext):
     if message.from_user.id not in MANAGERS:
         await message.answer("❌ Ця функція доступна тільки керівникам.")
         return
-    
-    # Якщо викликано через команду з аргументами одразу
-    args = message.text.split(maxsplit=2)
-    if len(args) >= 3 and not message.text.startswith("👤"):
-        try:
-            add_employee_to_db(int(args[1]), args[2])
-            await message.answer(f"✅ Працівника **{args[2]}** додано до бази!", parse_mode="Markdown")
-            return
-        except ValueError:
-            await message.answer("⚠️ Telegram ID має складатися лише з цифр.")
-            return
-
     await message.answer("Введіть дані працівника у форматі:\n`ID Ім'я`\n(наприклад: `123456789 Олександр`)", parse_mode="Markdown")
     await state.set_state(AddEmployee.waiting_for_data)
 
@@ -246,6 +248,7 @@ async def process_employee_data(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ ID повинен бути числом. Спробуйте ще раз у форматі `ID Ім'я`:")
 
+# Експорт в Excel
 @dp.message(F.text == "📊 Експорт в Excel")
 @dp.message(Command("export"))
 async def btn_export(message: types.Message):
@@ -257,6 +260,7 @@ async def btn_export(message: types.Message):
     doc_file = types.BufferedInputFile(excel_file.read(), filename="tasks_report.xlsx")
     await message.answer_document(doc_file, caption="📊 **Актуальний звіт із завданнями в Excel**", parse_mode="Markdown")
 
+# Статистика
 @dp.message(F.text == "📈 Статистика")
 @dp.message(Command("stats"))
 async def btn_stats(message: types.Message):
@@ -273,6 +277,93 @@ async def btn_stats(message: types.Message):
         text += f"👤 **{name}** (`{assignee_id}`):\n   • Виконано: ✅ {completed}\n   • В роботі: ⏳ {in_progress}\n   • Протерміновано: ⏰ {overdue}\n\n"
     await message.answer(text, parse_mode="Markdown")
 
+# --- ЛОГІКА УТОЧНЕНЬ ВІД ПРАЦІВНИКА ---
+@dp.message(F.text == "❓ Уточнення по задачі")
+async def employee_ask_clarification(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    tasks = get_employee_active_tasks(user_id)
+    if not tasks:
+        await message.answer("У вас немає активних завдань, по яких потрібні уточнення.")
+        return
+
+    kb = InlineKeyboardBuilder()
+    for task_id, text, deadline in tasks:
+        short_text = (text[:25] + '..') if len(text) > 25 else text
+        kb.button(text=f"#{task_id}: {short_text}", callback_data=f"ask_clar_{task_id}")
+    kb.adjust(1)
+
+    await message.answer("Оберіть завдання, по якому хочете зробити уточнення:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("ask_clar_"))
+async def process_clarification_task_choice(callback: types.CallbackQuery, state: FSMContext):
+    task_id = int(callback.data.split("_")[2])
+    await state.update_data(clar_task_id=task_id)
+    await callback.message.edit_text(f"Введіть ваше запитання / уточнення для завдання #{task_id}:", parse_mode="Markdown")
+    await state.set_state(TaskClarification.waiting_for_question)
+    await callback.answer()
+
+@dp.message(TaskClarification.waiting_for_question)
+async def send_clarification_to_manager(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get('clar_task_id')
+    await state.clear()
+
+    task = get_task(task_id)
+    if not task:
+        await message.answer("Помилка: завдання не знайдено.")
+        return
+
+    manager_id = task[2]
+    emp_name = get_employee_name(message.from_user.id)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💬 Відповісти на уточнення", callback_data=f"reply_clar_{task_id}_{message.from_user.id}")
+    kb.adjust(1)
+
+    try:
+        await bot.send_message(
+            chat_id=manager_id,
+            text=f"❓ **Уточнення від працівника ({emp_name}) по задачі #{task_id}:**\n\n{message.text}",
+            reply_markup=kb.as_markup(),
+            parse_mode="Markdown"
+        )
+        await message.answer("✅ Ваше запитання успішно надіслано керівнику!", reply_markup=get_employee_keyboard())
+    except Exception as e:
+        await message.answer(f"⚠️ Не вдалося надіслати повідомлення керівнику: {e}")
+
+@dp.callback_query(F.data.startswith("reply_clar_"))
+async def manager_start_reply(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in MANAGERS:
+        await callback.answer("Ви не керівник!", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    task_id = int(parts[2])
+    employee_id = int(parts[3])
+
+    await state.update_data(reply_task_id=task_id, reply_employee_id=employee_id)
+    await callback.message.answer(f"Введіть відповідь на уточнення для завдання #{task_id}:", parse_mode="Markdown")
+    await state.set_state(ManagerReply.waiting_for_answer)
+    await callback.answer()
+
+@dp.message(ManagerReply.waiting_for_answer)
+async def send_manager_answer_to_employee(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get('reply_task_id')
+    employee_id = data.get('reply_employee_id')
+    await state.clear()
+
+    try:
+        await bot.send_message(
+            chat_id=employee_id,
+            text=f"💡 **Відповідь керівника на уточнення по задачі #{task_id}:**\n\n{message.text}",
+            parse_mode="Markdown"
+        )
+        await message.answer(f"✅ Відповідь успішно надіслано працівнику!", reply_markup=get_manager_keyboard())
+    except Exception as e:
+        await message.answer(f"⚠️ Помилка надсилання відповіді працівнику: {e}")
+
+# --- СТВОРЕННЯ ЗАДАЧІ ---
 @dp.message(F.text == "➕ Створити задачу")
 @dp.message(Command("newtask"))
 async def btn_new_task(message: types.Message, state: FSMContext):
@@ -287,7 +378,7 @@ async def process_task_text(message: types.Message, state: FSMContext):
     await state.update_data(task_text=message.text)
     employees = get_employees()
     if not employees:
-        await message.answer("⚠️ База працівників порожня! Спочатку додайте співробітника за допомогою кнопки «👤 Додати працівника».", parse_mode="Markdown")
+        await message.answer("⚠️ База працівників порожня! Додайте співробітника за допомогою кнопки «👤 Додати працівника».", parse_mode="Markdown")
         await state.clear()
         return
 
