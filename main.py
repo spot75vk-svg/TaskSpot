@@ -134,9 +134,10 @@ def get_employee_name(telegram_id):
 def get_manager_keyboard():
     kb = ReplyKeyboardBuilder()
     kb.button(text="➕ Створити задачу")
+    kb.button(text="👤 Додати працівника")
     kb.button(text="📊 Експорт в Excel")
     kb.button(text="📈 Статистика")
-    kb.adjust(2, 1)
+    kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True)
 
 def get_employee_keyboard():
@@ -190,6 +191,9 @@ class CreateTask(StatesGroup):
     waiting_for_assignee = State()
     waiting_for_deadline = State()
 
+class AddEmployee(StatesGroup):
+    waiting_for_data = State()
+
 # --- ХЕНДЛЕРИ КОМАНД ТА КНОПОК ---
 
 @dp.message(Command("start"))
@@ -205,20 +209,42 @@ async def cmd_start(message: types.Message):
         )
         await message.answer(text, reply_markup=get_employee_keyboard(), parse_mode="Markdown")
 
+# Додавання працівника через кнопку або команду
+@dp.message(F.text == "👤 Додати працівника")
 @dp.message(Command("addemp"))
-async def cmd_add_emp(message: types.Message):
+async def cmd_add_emp(message: types.Message, state: FSMContext):
     if message.from_user.id not in MANAGERS:
-        await message.answer("❌ Ця команда доступна тільки керівникам.")
+        await message.answer("❌ Ця функція доступна тільки керівникам.")
         return
+    
+    # Якщо викликано через команду з аргументами одразу
     args = message.text.split(maxsplit=2)
-    if len(args) < 3:
-        await message.answer("⚠️ Використовуйте формат: `/addemp Telegram_ID Ім'я`", parse_mode="Markdown")
+    if len(args) >= 3 and not message.text.startswith("👤"):
+        try:
+            add_employee_to_db(int(args[1]), args[2])
+            await message.answer(f"✅ Працівника **{args[2]}** додано до бази!", parse_mode="Markdown")
+            return
+        except ValueError:
+            await message.answer("⚠️ Telegram ID має складатися лише з цифр.")
+            return
+
+    await message.answer("Введіть дані працівника у форматі:\n`ID Ім'я`\n(наприклад: `123456789 Олександр`)", parse_mode="Markdown")
+    await state.set_state(AddEmployee.waiting_for_data)
+
+@dp.message(AddEmployee.waiting_for_data)
+async def process_employee_data(message: types.Message, state: FSMContext):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ Невірний формат. Введіть у форматі: `ID Ім'я`", parse_mode="Markdown")
         return
     try:
-        add_employee_to_db(int(args[1]), args[2])
-        await message.answer(f"✅ Працівника **{args[2]}** додано до бази!", parse_mode="Markdown")
+        emp_id = int(args[0])
+        emp_name = args[1]
+        add_employee_to_db(emp_id, emp_name)
+        await state.clear()
+        await message.answer(f"✅ Працівника **{emp_name}** (`{emp_id}`) успішно додано до бази!", parse_mode="Markdown", reply_markup=get_manager_keyboard())
     except ValueError:
-        await message.answer("⚠️ Telegram ID має складатися лише з цифр.")
+        await message.answer("⚠️ ID повинен бути числом. Спробуйте ще раз у форматі `ID Ім'я`:")
 
 @dp.message(F.text == "📊 Експорт в Excel")
 @dp.message(Command("export"))
@@ -261,7 +287,7 @@ async def process_task_text(message: types.Message, state: FSMContext):
     await state.update_data(task_text=message.text)
     employees = get_employees()
     if not employees:
-        await message.answer("⚠️ База працівників порожня! Додайте співробітника командою `/addemp ID Ім'я`.", parse_mode="Markdown")
+        await message.answer("⚠️ База працівників порожня! Спочатку додайте співробітника за допомогою кнопки «👤 Додати працівника».", parse_mode="Markdown")
         await state.clear()
         return
 
@@ -296,7 +322,7 @@ async def process_deadline(message: types.Message, state: FSMContext):
     await state.clear()
 
     emp_name = get_employee_name(data['assignee_id'])
-    await message.answer(f"✅ Задачу #{task_id} відправлено працівнику **{emp_name}**!", parse_mode="Markdown")
+    await message.answer(f"✅ Задачу #{task_id} відправлено працівнику **{emp_name}**!", parse_mode="Markdown", reply_markup=get_manager_keyboard())
 
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Відмітити як виконану", callback_data=f"done_{task_id}")
