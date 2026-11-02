@@ -10,10 +10,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= КОНФІГУРАЦІЯ =================
-# 1. Вставте  ваш токен від BotFather у лапки нижче:
+# Вставте ваш токен від BotFather у лапки нижче:
 BOT_TOKEN = "9071631760:AAFFOcT4-jgBe4PSqQ3VYwveIpGmjZZXck0"
 
-# 2. Перелік Telegram ID керівників (через кому):
+# Перелік Telegram ID керівників (через кому):
 MANAGERS = [66491739]
 # =================================================
 
@@ -183,4 +183,109 @@ async def process_task_text(message: types.Message, state: FSMContext):
     for emp_id, emp_name in employees:
         kb.button(text=f"👤 {emp_name}", callback_data=f"select_emp_{emp_id}")
     kb.adjust(1)
-    await message.answer("Виберіть працівника:",
+    await message.answer("Виберіть працівника:", reply_markup=kb.as_markup())
+    await state.set_state(CreateTask.waiting_for_assignee)
+
+@dp.callback_query(F.data.startswith("select_emp_"), CreateTask.waiting_for_assignee)
+async def process_employee_selection(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(assignee_id=int(callback.data.split("_")[2]))
+    await callback.message.edit_text("Введіть дедлайн у форматі `ДД.ММ.РРРР ГГ:ХХ` (наприклад: `15.11.2026 18:00`):", parse_mode="Markdown")
+    await state.set_state(CreateTask.waiting_for_deadline)
+    await callback.answer()
+
+@dp.message(CreateTask.waiting_for_deadline)
+async def process_deadline(message: types.Message, state: FSMContext):
+    try:
+        datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M")
+    except ValueError:
+        await message.answer("⚠️ Невірний формат! Введіть дату у форматі `ДД.ММ.РРРР ГГ:ХХ`:", parse_mode="Markdown")
+        return
+
+    data = await state.get_data()
+    task_id = add_task(data['task_text'], message.from_user.id, data['assignee_id'], message.text.strip())
+    await state.clear()
+
+    emp_name = get_employee_name(data['assignee_id'])
+    await message.answer(f"✅ Задачу #{task_id} відправлено працівнику **{emp_name}**!", parse_mode="Markdown")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Відмітити як виконану", callback_data=f"done_{task_id}")
+    try:
+        await bot.send_message(
+            chat_id=data['assignee_id'],
+            text=f"📋 **Нове завдання #{task_id}:**\n\n{data['task_text']}\n\n⏳ **Дедлайн:** {message.text.strip()}",
+            reply_markup=kb.as_markup(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await message.answer(f"⚠️ Не вдалося надіслати сповіщення у приватні повідомлення: {e}")
+
+@dp.callback_query(F.data.startswith("done_"))
+async def process_task_done(callback: types.CallbackQuery):
+    task_id = int(callback.data.split("_")[1])
+    task = get_task(task_id)
+    if not task:
+        await callback.answer("Завдання не знайдено.")
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👍 Підтвердити", callback_data=f"approve_{task_id}")
+    kb.button(text="🔄 На доопрацювання", callback_data=f"reject_{task_id}")
+    kb.adjust(2)
+
+    await bot.send_message(
+        chat_id=task[2],
+        text=f"🔔 **Працівник відмітив задачу #{task_id} як виконану!**\n\n{task[1]}",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+    await callback.message.edit_text(f"⏳ **Завдання #{task_id} на перевірці у керівника.**", parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("approve_"))
+async def approve_task(callback: types.CallbackQuery):
+    if callback.from_user.id not in MANAGERS:
+        await callback.answer("Ви не керівник!", show_alert=True)
+        return
+    task_id = int(callback.data.split("_")[1])
+    task = get_task(task_id)
+    update_task_status(task_id, "completed")
+    await callback.message.edit_text(f"✅ **Завдання #{task_id} підтверджено та закрито!**", parse_mode="Markdown")
+    await bot.send_message(task[3], f"🎉 **Керівник підтвердив виконання завдання #{task_id}!**", parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_task(callback: types.CallbackQuery):
+    if callback.from_user.id not in MANAGERS:
+        await callback.answer("Ви не керівник!", show_alert=True)
+        return
+    task_id = int(callback.data.split("_")[1])
+    task = get_task(task_id)
+    update_task_status(task_id, "in_progress")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Відмітити як виконану", callback_data=f"done_{task_id}")
+    await callback.message.edit_text(f"🔄 **Завдання #{task_id} повернуто на доопрацювання.**", parse_mode="Markdown")
+    await bot.send_message(task[3], f"⚠️ **Завдання #{task_id} повернуто на доопрацювання!**", reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await callback.answer()
+
+async def check_deadlines():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            for task in get_active_tasks():
+                if datetime.now() > datetime.strptime(task[4], "%d.%m.%Y %H:%M"):
+                    update_task_status(task[0], "overdue")
+                    await bot.send_message(task[3], f"⏰ **УВАГА! Дедлайн завдання #{task[0]} вичерпано!**", parse_mode="Markdown")
+                    await bot.send_message(task[2], f"⚠️ **Дедлайн завдання #{task[0]} протерміновано!**", parse_mode="Markdown")
+        except Exception as e:
+            print(f"Помилка перевірки дедлайнів: {e}")
+
+async def main():
+    init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(check_deadlines())
+    print("Бот успішно запущений...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
