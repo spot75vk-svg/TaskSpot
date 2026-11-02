@@ -10,7 +10,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= КОНФІГУРАЦІЯ =================
-# 1. Вставте ваш токен від BotFather у лапки нижче:
+# 1. Вставте  ваш токен від BotFather у лапки нижче:
 BOT_TOKEN = "9036019477:AAFW4m19YzOje2eX2MklpCeQGoHHxjclKGI"
 
 # 2. Перелік Telegram ID керівників (через кому):
